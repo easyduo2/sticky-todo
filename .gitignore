@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 构建产物
+build/
+dist/
+StickyTodo
+StickyTodo.app
+
+# 发布包
+*.dmg
+*.zip
+*.tar.gz
+
+# 编译临时
+*.o
+*.swiftmodule
+*.swiftdoc
+vfs-file.yaml
+empty.swiftmodule
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/
