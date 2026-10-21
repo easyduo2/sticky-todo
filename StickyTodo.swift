@@ -134,13 +134,15 @@ struct TodoItem: Identifiable, Codable {
     var completedAt: Date?
     /// 定时提醒时间（`#时间` 语法解析后单独存储；nil 表示无提醒）
     var remindAt: Date?
+    /// V6：绑定日期（`#日期` 语法解析后单独存储；用于今日优先/时间线/历史按日期归属排序；nil 表示无绑定日期）
+    var dueDate: Date?
     /// 优先级：0普通 / 1重要 / 2紧急（`!` / `!!` 前缀解析）
     var priority: Int = 0
     /// 重复任务规则（`#每日` / `#每周X` / `#每月X号`；nil 表示一次性）
     var repeatRule: RepeatRule?
 
     init(id: UUID = UUID(), text: String, done: Bool = false, createdAt: Date = Date(),
-         completedAt: Date? = nil, remindAt: Date? = nil,
+         completedAt: Date? = nil, remindAt: Date? = nil, dueDate: Date? = nil,
          priority: Int = 0, repeatRule: RepeatRule? = nil) {
         self.id = id
         self.text = text
@@ -148,12 +150,13 @@ struct TodoItem: Identifiable, Codable {
         self.createdAt = createdAt
         self.completedAt = completedAt
         self.remindAt = remindAt
+        self.dueDate = dueDate
         self.priority = priority
         self.repeatRule = repeatRule
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, text, done, createdAt, completedAt, remindAt, priority, repeatRule
+        case id, text, done, createdAt, completedAt, remindAt, dueDate, priority, repeatRule
     }
 
     /// 旧数据兼容：缺失字段（priority/repeatRule）自动回退默认值
@@ -165,6 +168,7 @@ struct TodoItem: Identifiable, Codable {
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         completedAt = try c.decodeIfPresent(Date.self, forKey: .completedAt)
         remindAt = try c.decodeIfPresent(Date.self, forKey: .remindAt)
+        dueDate = try c.decodeIfPresent(Date.self, forKey: .dueDate)
         priority = try c.decodeIfPresent(Int.self, forKey: .priority) ?? 0
         repeatRule = try c.decodeIfPresent(RepeatRule.self, forKey: .repeatRule)
     }
@@ -252,6 +256,25 @@ enum TimeText {
         }
         return fmt.string(from: date)
     }
+
+    /// V6：绑定日期胶囊显示：今年 → "M月d日"；跨年 → "yyyy-MM-dd"
+    static func dueString(_ date: Date) -> String {
+        let cal = Calendar.current
+        let fmt = DateFormatter()
+        if cal.component(.year, from: date) == cal.component(.year, from: Date()) {
+            fmt.dateFormat = "M月d日"
+        } else {
+            fmt.dateFormat = "yyyy-MM-dd"
+        }
+        return fmt.string(from: date)
+    }
+
+    /// V6：编辑/添加时重建 `#日期` 语法（始终用完整日期，保证可再解析）
+    static func dueEditString(_ date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: date)
+    }
 }
 
 // MARK: - 提醒时间解析（# 语法）
@@ -331,6 +354,79 @@ enum TimeParser {
     }
 }
 
+// MARK: - 绑定日期解析（#日期 语法）
+
+enum DateParser {
+    /// 从文本中提取第一个 `#日期`，返回（去掉日期片段的干净文本, 绑定日期当日 00:00）。
+    /// 支持：`#2026-10-20`（完整日期）、`#10-20` / `#10月20日`（今年；已过则明年）。
+    /// 注意：带时间的 `#10-20 10:00` 已由 TimeParser 优先消费，此处仅匹配纯日期。
+    static func parseDueDate(_ text: String) -> (clean: String, date: Date)? {
+        let patterns: [(regex: String, build: ([Int]) -> Date?)] = [
+            // #2026-10-20
+            (regex: #"#\s*(\d{4})-(\d{1,2})-(\d{1,2})"#,
+             build: { c in
+                 guard c.count == 3 else { return nil }
+                 return day(year: c[0], month: c[1], day: c[2])
+             }),
+            // #10-20（今年；已过则明年）
+            (regex: #"#\s*(\d{1,2})-(\d{1,2})"#,
+             build: { c in
+                 guard c.count == 2 else { return nil }
+                 let year = Calendar.current.component(.year, from: Date())
+                 if let d = day(year: year, month: c[0], day: c[1]) {
+                     if d < Date() {
+                         return day(year: year + 1, month: c[0], day: c[1])
+                     }
+                     return d
+                 }
+                 return nil
+             }),
+            // #10月20日（今年；已过则明年）
+            (regex: #"#\s*(\d{1,2})月(\d{1,2})日?"#,
+             build: { c in
+                 guard c.count == 2 else { return nil }
+                 let year = Calendar.current.component(.year, from: Date())
+                 if let d = day(year: year, month: c[0], day: c[1]) {
+                     if d < Date() {
+                         return day(year: year + 1, month: c[0], day: c[1])
+                     }
+                     return d
+                 }
+                 return nil
+             })
+        ]
+
+        let nsText = text as NSString
+        for p in patterns {
+            guard let regex = try? NSRegularExpression(pattern: p.regex) else { continue }
+            guard let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: nsText.length)) else { continue }
+            var comps: [Int] = []
+            for i in 1..<match.numberOfRanges {
+                let r = match.range(at: i)
+                guard r.location != NSNotFound else { return nil }
+                comps.append(Int(nsText.substring(with: r)) ?? 0)
+            }
+            guard let d = p.build(comps) else { continue }
+            let clean = nsText.replacingCharacters(in: match.range, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (clean, d)
+        }
+        return nil
+    }
+
+    private static func day(year: Int, month: Int, day: Int) -> Date? {
+        guard (1...12).contains(month), (1...31).contains(day) else { return nil }
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = day
+        comps.hour = 0
+        comps.minute = 0
+        comps.second = 0
+        return Calendar.current.date(from: comps)
+    }
+}
+
 // MARK: - 重复任务解析（#每日 / #每周X / #每月X号）
 
 enum RepeatParser {
@@ -384,6 +480,8 @@ enum RepeatParser {
 struct ParsedTask {
     var clean: String
     var remindAt: Date?
+    /// V6：绑定日期（`#日期` 语法解析结果；nil 表示无绑定日期）
+    var dueDate: Date?
     var repeatRule: RepeatRule?
     var priority: Int
 }
@@ -417,9 +515,17 @@ enum TaskSyntax {
             clean = r.clean
         }
 
+        // 4) 绑定日期（在时间之后解析，避免 `#10-20 10:00` 被误判为纯日期）
+        var dueDate: Date?
+        if let r = DateParser.parseDueDate(clean) {
+            dueDate = r.date
+            clean = r.clean
+        }
+
         return ParsedTask(
             clean: clean.trimmingCharacters(in: .whitespacesAndNewlines),
             remindAt: remindAt,
+            dueDate: dueDate,
             repeatRule: repeatRule,
             priority: priority
         )
@@ -702,13 +808,15 @@ struct WeeklyReport {
         )
     }
 
-    /// 今日待办：今日未完成且（提醒时间 / 重复规则）属于今日（与菜单栏角标口径一致）
+    /// 今日待办：今日未完成且（提醒时间 / 绑定日期 / 重复规则）属于今日（与菜单栏角标口径一致）
     private static func todayDueCount(notes: [Note], cal: Calendar, now: Date) -> Int {
         var count = 0
         for note in notes {
             for t in note.todos where !t.done {
                 var dueToday = false
                 if let r = t.remindAt, cal.isDateInToday(r) { dueToday = true }
+                // V6：绑定日期为今日 → 计入今日待办
+                if let d = t.dueDate, cal.isDateInToday(d) { dueToday = true }
                 if let rule = t.repeatRule {
                     switch rule.kind {
                     case .daily:
@@ -807,11 +915,11 @@ struct TodoRowView: View {
         colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.07)
     }
 
-    /// 编辑时实时解析任务语法（#时间 / #重复）：输入即识别，未保存也显示徽标；清除语法后自动消失
+    /// 编辑时实时解析任务语法（#时间 / #日期 / #重复）：输入即识别，未保存也显示徽标；清除语法后自动消失
     private var liveSyntax: ParsedTask? {
         guard editing, !editText.isEmpty else { return nil }
         let p = TaskSyntax.parse(editText)
-        if p.remindAt == nil && p.repeatRule == nil { return nil }
+        if p.remindAt == nil && p.repeatRule == nil && p.dueDate == nil { return nil }
         return p
     }
 
@@ -911,6 +1019,14 @@ struct TodoRowView: View {
                                 }
                                 if let d = live.remindAt {
                                     Label("将在 \(TimeText.reminderString(d)) 提醒", systemImage: "clock")
+                                        .font(.system(size: 9.5, weight: .medium))
+                                        .foregroundColor(accent)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1.5)
+                                        .background(Capsule().fill(accent.opacity(0.13)))
+                                }
+                                if let due = live.dueDate {
+                                    Label("\(TimeText.dueString(due))", systemImage: "calendar")
                                         .font(.system(size: 9.5, weight: .medium))
                                         .foregroundColor(accent)
                                         .padding(.horizontal, 6)
@@ -1019,6 +1135,17 @@ struct TodoRowView: View {
                         .padding(.vertical, 1.5)
                         .background(Capsule().fill(accent.opacity(0.13)))
                 }
+
+                // V6：绑定日期徽标（#日期 语法 → 只读展示；编辑可修改/清除）
+                if let due = todo.dueDate {
+                    Label(TimeText.dueString(due), systemImage: "calendar")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(accent.opacity(todo.done ? 0.4 : 0.85))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(accent.opacity(0.13)))
+                        .help("绑定日期 \(TimeText.dueEditString(due))")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -1051,10 +1178,11 @@ struct TodoRowView: View {
 
     private func startEdit() {
         editing = true
-        // 重建语法前缀：优先级（!! / !）+ 重复规则（#每日 等），编辑提交时再解析回字段
+        // 重建语法前缀：优先级（!! / !）+ 重复规则（#每日 等）+ 绑定日期（#2026-10-20），编辑提交时再解析回字段
         let p = todo.priority == 2 ? "!! " : (todo.priority == 1 ? "! " : "")
         let r = todo.repeatRule.map { "#\($0.inputText) " } ?? ""
-        editText = p + r + todo.text
+        let d = todo.dueDate.map { "#\(TimeText.dueEditString($0)) " } ?? ""
+        editText = p + r + d + todo.text
         DispatchQueue.main.async {
             editFocused = true
         }
@@ -1075,20 +1203,22 @@ struct TodoRowView: View {
             return
         }
 
-        // 综合解析：优先级前缀 + #重复规则 + #时间
+        // 综合解析：优先级前缀 + #重复规则 + #时间 + #日期
         let parsed = TaskSyntax.parse(v)
         if let r = parsed.remindAt {
             todo.remindAt = r
             // V4：提醒时间修改后重置已发超时标记，新时间过期后可重新追加提醒
             ReminderManager.shared.resetOverdueMark(for: todo.id)
         }
+        // V6：绑定日期（编辑框已重建 #日期 前缀，删除即清除）
+        todo.dueDate = parsed.dueDate
         // 重复规则：编辑框已重建规则前缀，删除 #规则 即清除（与 #时间 保留语义不同）
         todo.repeatRule = parsed.repeatRule
         // 编辑文本即修改优先级：无前缀 → 普通
         todo.priority = parsed.priority
         if !parsed.clean.isEmpty {
             todo.text = parsed.clean
-        } else if parsed.remindAt == nil && parsed.repeatRule == nil && !v.isEmpty {
+        } else if parsed.remindAt == nil && parsed.repeatRule == nil && parsed.dueDate == nil && !v.isEmpty {
             // 无任何语法且文本非空
             todo.text = v
         }
@@ -1167,11 +1297,11 @@ struct NoteCardView: View {
         colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.07)
     }
 
-    /// 添加待办输入时实时解析任务语法（#重复 / #时间）：输入即识别，未提交也显示徽标；清除语法后自动消失
+    /// 添加待办输入时实时解析任务语法（#重复 / #时间 / #日期）：输入即识别，未提交也显示徽标；清除语法后自动消失
     private var liveAddSyntax: ParsedTask? {
         guard !newTodoText.isEmpty else { return nil }
         let p = TaskSyntax.parse(newTodoText)
-        if p.remindAt == nil && p.repeatRule == nil { return nil }
+        if p.remindAt == nil && p.repeatRule == nil && p.dueDate == nil { return nil }
         return p
     }
 
@@ -1192,9 +1322,18 @@ struct NoteCardView: View {
         searchActive && note.title.localizedCaseInsensitiveContains(searchText)
     }
 
+    /// V6：已完成超过 7 天的任务从列表隐藏（仅展示层过滤，数据保留；历史/热图/备份仍含）
+    private func isHiddenAfter7Days(_ t: TodoItem) -> Bool {
+        guard t.done, let comp = t.completedAt else { return false }
+        let cal = Calendar.current
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: comp), to: cal.startOfDay(for: Date())).day ?? 0
+        return days > 7
+    }
+
     /// V2 搜索过滤后的待办索引：未搜索 → 全部；标题命中 → 全部；否则只保留文本命中的待办
+    /// V6：先剔除「已完成超 7 天」的任务（隐藏仅作用于列表展示层，数据不删除）
     private var displayTodoIndices: [Int] {
-        let sorted = sortedTodoIndices
+        let sorted = sortedTodoIndices.filter { !isHiddenAfter7Days(note.todos[$0]) }
         guard searchActive else { return sorted }
         if titleMatched { return sorted }
         return sorted.filter { note.todos[$0].text.localizedCaseInsensitiveContains(searchText) }
@@ -1214,6 +1353,14 @@ struct NoteCardView: View {
                 }
                 if let d = live.remindAt {
                     Label("将在 \(TimeText.reminderString(d)) 提醒", systemImage: "clock")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(effectiveAccent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(effectiveAccent.opacity(0.13)))
+                }
+                if let due = live.dueDate {
+                    Label(TimeText.dueString(due), systemImage: "calendar")
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundColor(effectiveAccent)
                         .padding(.horizontal, 6)
@@ -1332,6 +1479,13 @@ struct NoteCardView: View {
                         .foregroundColor(.secondary)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
+                } else if displayTodoIndices.isEmpty {
+                    // V7：有数据但列表为空 → 全部被过滤（搜索无命中 / 已完成超 7 天已归档历史，不再展示占位文案）
+                    Text(searchActive ? "没有匹配的待办" : "暂无待办")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
                 }
                 ForEach(displayTodoIndices, id: \.self) { idx in
                     TodoRowView(
@@ -1446,10 +1600,11 @@ struct NoteCardView: View {
         guard !v.isEmpty else { return }
         let parsed = TaskSyntax.parse(v)
         var item = TodoItem(text: parsed.clean.isEmpty ? v : parsed.clean)
-        // 综合语法：优先级前缀 / #重复规则 / #时间
+        // 综合语法：优先级前缀 / #重复规则 / #时间 / #日期
         item.priority = parsed.priority
         item.repeatRule = parsed.repeatRule
         item.remindAt = parsed.remindAt
+        item.dueDate = parsed.dueDate
         withAnimation(.easeOut(duration: 0.15)) {
             note.todos.append(item)
         }
@@ -1475,7 +1630,8 @@ struct HeatmapView: View {
         return cal.date(byAdding: .day, value: -(totalDays - 1), to: today)!
     }
 
-    /// 按自然日聚合「新增 + 完成」数量
+    /// 按自然日聚合「新增 + 完成 + 绑定日期」数量
+    /// V6：绑定日期（dueDate）也按当日归属计入热图
     private var counts: [Date: Int] {
         var dict: [Date: Int] = [:]
         let cal = Calendar.current
@@ -1484,6 +1640,9 @@ struct HeatmapView: View {
                 dict[cal.startOfDay(for: t.createdAt), default: 0] += 1
                 if let comp = t.completedAt {
                     dict[cal.startOfDay(for: comp), default: 0] += 1
+                }
+                if let due = t.dueDate {
+                    dict[cal.startOfDay(for: due), default: 0] += 1
                 }
             }
         }
@@ -1529,7 +1688,7 @@ struct HeatmapView: View {
                 Label("时间线热图", systemImage: "calendar")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text("近 \(totalDays) 天 · 新增 + 完成")
+                Text("近 \(totalDays) 天 · 新增 + 完成 + 绑定日期")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
@@ -1604,7 +1763,7 @@ struct HistoryView: View {
             ? Color(red: 0.62, green: 0.70, blue: 0.95)
             : Color(red: 0.35, green: 0.42, blue: 0.62)
     }
-    /// 已完成待办（按完成时间倒序）
+    /// 已完成待办（V6：有绑定日期按绑定日期倒序，无绑定日期按完成时间倒序）
     private var completedItems: [(note: Note, todo: TodoItem)] {
         var items: [(Note, TodoItem)] = []
         for n in store.notes {
@@ -1612,7 +1771,9 @@ struct HistoryView: View {
                 items.append((n, t))
             }
         }
-        return items.sorted { ($0.1.completedAt ?? .distantPast) > ($1.1.completedAt ?? .distantPast) }
+        return items.sorted {
+            ($0.1.dueDate ?? $0.1.completedAt ?? .distantPast) > ($1.1.dueDate ?? $1.1.completedAt ?? .distantPast)
+        }
     }
 
     var body: some View {
@@ -1764,6 +1925,15 @@ struct HistoryRow: View {
                             .padding(.vertical, 1)
                             .background(Capsule().fill(note.color.accent(for: colorScheme).opacity(0.12)))
                     }
+                    // V6：历史记录显示绑定日期徽标
+                    if let due = todo.dueDate {
+                        Label(TimeText.dueString(due), systemImage: "calendar")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(note.color.accent(for: colorScheme).opacity(0.75))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(note.color.accent(for: colorScheme).opacity(0.12)))
+                    }
                 }
                 Text("完成于 \(TimeText.relative(todo.completedAt ?? Date()))")
                     .font(.system(size: 10))
@@ -1852,6 +2022,8 @@ struct ContentView: View {
             if cal.isDateInToday(n.createdAt) || cal.isDateInToday(n.updatedAt) { return true }
             return n.todos.contains { t in
                 cal.isDateInToday(t.createdAt) || (t.completedAt.map { cal.isDateInToday($0) } ?? false)
+                    // V6：绑定日期为今日 → 便签今日优先
+                    || (t.dueDate.map { cal.isDateInToday($0) } ?? false)
             }
         }
         func maxPriority(_ n: Note) -> Int {
@@ -2118,8 +2290,6 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var hoverTracker: HoverTracker!
-    private var hoverShown = false
-    private var hoverWorkItem: DispatchWorkItem?
     /// 角标：5 分钟定时刷新 + 数据变更即时刷新
     private var badgeTimer: Timer?
     private var badgeObserver: NSObjectProtocol?
@@ -2137,23 +2307,19 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         button.imagePosition = .imageLeading
         button.target = self
         button.action = #selector(handleClick)
-        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        button.sendAction(on: [.leftMouseDown, .rightMouseUp])
         button.toolTip = "便签 TodoList（左键便签面板，右键打开主窗口）"
 
         // 注意：不设置 button.menu，避免与 action/sendAction 冲突导致点击行为异常；
         // 右键菜单在 handleClick 中通过 NSMenu.popUpContextMenu 手动弹出。
 
-        // 悬停跟踪：高亮 + 延迟自动弹出面板（延迟给右键留出时机，避免抢事件）
+        // 悬停跟踪：仅高亮；面板完全由点击切换控制，避免 hover 自动弹出与点击 toggle 竞态
         hoverTracker = HoverTracker(
-            onEnter: { [weak self, weak button] in
-                guard let self = self else { return }
+            onEnter: { [weak button] in
                 button?.isHighlighted = true
-                self.hoverShown = true
-                self.scheduleHoverPopover()
             },
-            onExit: { [weak self, weak button] in
+            onExit: { [weak button] in
                 button?.isHighlighted = false
-                self?.hoverWorkItem?.cancel()
             }
         )
         let area = NSTrackingArea(
@@ -2233,6 +2399,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             for t in note.todos where !t.done {
                 var dueToday = false
                 if let r = t.remindAt, cal.isDateInToday(r) { dueToday = true }
+                // V6：绑定日期为今日 → 计入今日待办
+                if let d = t.dueDate, cal.isDateInToday(d) { dueToday = true }
                 if let rule = t.repeatRule {
                     switch rule.kind {
                     case .daily:
@@ -2247,16 +2415,6 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             }
         }
         return count
-    }
-
-    private func scheduleHoverPopover() {
-        hoverWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            if self.hoverShown { self.showPopover() }
-        }
-        hoverWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     /// 左键：切换面板；右键：手动弹出「打开主窗口 / 退出」菜单
@@ -2290,6 +2448,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func togglePopover() {
+        FileHandle.standardError.write("STICKY_DEBUG togglePopover isShown=\(popover.isShown)\n".data(using: .utf8)!)
         if popover.isShown {
             popover.performClose(nil)
         } else {
@@ -2330,9 +2489,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     // MARK: NSPopoverDelegate
     func popoverShouldClose(_ popover: NSPopover) -> Bool { true }
 
-    func popoverDidClose(_ notification: Notification) {
-        hoverShown = false
-    }
+    func popoverDidClose(_ notification: Notification) {}
 }
 
 // MARK: - V2 全局快速添加（Cmd+Shift+N）
@@ -2493,6 +2650,7 @@ struct QuickAddView: View {
         item.priority = parsed.priority
         item.repeatRule = parsed.repeatRule
         item.remindAt = parsed.remindAt
+        item.dueDate = parsed.dueDate
         let store = NoteStore.shared
         if store.notes.isEmpty {
             store.addNote()
@@ -3044,8 +3202,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            // 激活时若主窗口已打开，关闭菜单栏面板避免遮挡
-            self?.statusItemController?.closePopover()
+            guard let self = self else { return }
+            // 修复：accessory 模式下点击菜单栏面板内部会使 NSApp 激活并触发本通知，
+            // 若此时无条件 closePopover，面板内任意点击都会收起。
+            // 仅当主窗口已打开（regular 模式激活，需要避免面板遮挡）时才关闭面板。
+            let hasVisibleMainWindow = self.mainWindowController?.window?.isVisible == true
+            if hasVisibleMainWindow {
+                FileHandle.standardError.write("STICKY_DEBUG didBecomeActive close popover (main window visible)\n".data(using: .utf8)!)
+                self.statusItemController?.closePopover()
+            } else {
+                FileHandle.standardError.write("STICKY_DEBUG didBecomeActive keep popover (no main window)\n".data(using: .utf8)!)
+            }
         })
         // V2：面板内「快速添加」按钮兜底入口
         observers.append(noteCenter.addObserver(
