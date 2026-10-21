@@ -23,6 +23,8 @@ macOS 菜单栏便签 Todolist —— 一个零依赖、单文件、原生 Swift
 - **导出 / 导入备份**：JSON 一键备份与恢复
 - **周报小结**：一键生成本周完成统计并复制文本
 - **深色模式**：全面适配 macOS 深色 / 浅色外观
+- **7 日自动归档**：已完成任务超过 7 天后自动从便签栏归档到历史区（历史区仍可随时查看）
+- **标题 #日期 绑定**：标题输入 `#2026-10-20` / `#10-20` / `#10月20日` 自动绑定到对应日期视图，与 `#时间提醒` 可并存
 
 ## 技术说明
 
@@ -99,7 +101,7 @@ codesign --force --deep --sign - StickyTodo.app   # ad-hoc 签名
 
 ## 安装方法
 
-1. 下载发布包 `StickyTodo-1.0.0-macOS.zip`（或 `.dmg`）并解压
+1. 下载发布包 `StickyTodo-1.1.0-macOS.zip`（或 `.dmg`）并解压
 2. 将 `StickyTodo.app` 拖入「应用程序」文件夹（`/Applications`）
 3. 首次打开：因未进行 Apple 开发者签名，macOS Gatekeeper 会拦截。任选其一：
    - **右键** `StickyTodo.app` → **打开** → 再次点击「打开」
